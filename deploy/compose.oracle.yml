@@ -1,0 +1,44 @@
+# Deploy do CRM no Oracle Cloud Free Tier (Always Free).
+# Rode a partir da RAIZ do repositório, com um .env já configurado lá:
+#   docker compose -f deploy/compose.oracle.yml up -d --build
+#
+# app (PHP 8.4) + MySQL 8.4. Sem Redis (cache/sessão/fila em 'database') para
+# caber folgado no free tier. Na 1ª subida o app roda scripts/setup-crm.sh
+# (instala Filament, migra, gera o painel e popula os 13 leads).
+services:
+  app:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.oracle
+    working_dir: /app
+    volumes:
+      - ..:/app
+    env_file:
+      - ../.env
+    ports:
+      - "80:8080"          # acesse http://SEU_IP_PUBLICO/admin
+    depends_on:
+      mysql:
+        condition: service_healthy
+    command: >
+      bash -lc "scripts/setup-crm.sh && php artisan serve --host=0.0.0.0 --port=8080"
+    restart: unless-stopped
+
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_DATABASE: ${DB_DATABASE:-leads}
+      MYSQL_USER: ${DB_USERNAME:-leads}
+      MYSQL_PASSWORD: ${DB_PASSWORD:-secret}
+      MYSQL_ROOT_PASSWORD: ${DB_ROOT_PASSWORD:-secret}
+    volumes:
+      - mysql:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-p${DB_PASSWORD:-secret}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+volumes:
+  mysql:
