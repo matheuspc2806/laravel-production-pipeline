@@ -1,0 +1,110 @@
+name: Deploy to Oracle (Always Free)
+
+# Deploy do Leads CRM numa VM Oracle Always Free, via SSH, a partir do runner.
+# Rode manualmente: aba Actions -> "Deploy to Oracle (Always Free)" -> Run workflow.
+# (Sem gatilho por push de propósito: evita tentar deploy antes dos secrets existirem.)
+#
+# Secrets necessários (repo -> Settings -> Secrets and variables -> Actions):
+#   DEPLOY_HOST     IP público da VM
+#   DEPLOY_USER     usuário SSH (ex.: ubuntu)
+#   DEPLOY_SSH_KEY  chave PRIVADA (conteúdo do arquivo, ex.: ed25519)
+#   DEPLOY_ENV      (recomendado) conteúdo do .env — base: deploy/.env.oracle.example
+#   DEPLOY_PORT     (opcional) porta SSH, padrão 22
+#   DEPLOY_PATH     (opcional) pasta na VM, padrão leads-crm
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-oracle
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      SSH_HOST: ${{ secrets.DEPLOY_HOST }}
+      SSH_USER: ${{ secrets.DEPLOY_USER }}
+      SSH_PORT: ${{ secrets.DEPLOY_PORT }}
+      DEST: ${{ secrets.DEPLOY_PATH }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Preparar SSH
+        env:
+          SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          [ -n "${SSH_HOST:-}" ] || { echo "::error::Falta o secret DEPLOY_HOST"; exit 1; }
+          [ -n "${SSH_USER:-}" ] || { echo "::error::Falta o secret DEPLOY_USER"; exit 1; }
+          [ -n "${SSH_KEY:-}" ]  || { echo "::error::Falta o secret DEPLOY_SSH_KEY"; exit 1; }
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_deploy
+          chmod 600 ~/.ssh/id_deploy
+          ssh-keyscan -p "${SSH_PORT:-22}" "$SSH_HOST" >> ~/.ssh/known_hosts 2>/dev/null || true
+          echo "DEST=${DEST:-leads-crm}" >> "$GITHUB_ENV"
+
+      - name: Bootstrap da VM (Docker, rsync, firewall local) — idempotente
+        run: |
+          set -euo pipefail
+          ssh -i ~/.ssh/id_deploy -p "${SSH_PORT:-22}" "$SSH_USER@$SSH_HOST" '
+            set -e
+            command -v docker >/dev/null 2>&1 || curl -fsSL https://get.docker.com | sudo sh
+            command -v rsync  >/dev/null 2>&1 || { sudo apt-get update && sudo apt-get install -y rsync; }
+            sudo iptables -C INPUT -p tcp --dport 80 -j ACCEPT 2>/dev/null \
+              || sudo iptables -I INPUT 6 -p tcp --dport 80 -j ACCEPT || true
+            command -v netfilter-persistent >/dev/null 2>&1 && sudo netfilter-persistent save || true
+          '
+
+      - name: Enviar .env (apenas se ainda não existir na VM)
+        env:
+          DEPLOY_ENV: ${{ secrets.DEPLOY_ENV }}
+        run: |
+          set -euo pipefail
+          if [ -z "${DEPLOY_ENV:-}" ]; then
+            echo "Sem DEPLOY_ENV — assumindo que o .env já está na VM."; exit 0
+          fi
+          ssh -i ~/.ssh/id_deploy -p "${SSH_PORT:-22}" "$SSH_USER@$SSH_HOST" "mkdir -p '$DEST'"
+          printf '%s' "$DEPLOY_ENV" | \
+            ssh -i ~/.ssh/id_deploy -p "${SSH_PORT:-22}" "$SSH_USER@$SSH_HOST" \
+              "test -f '$DEST/.env' || cat > '$DEST/.env'"
+
+      - name: Sincronizar o código para a VM
+        run: |
+          set -euo pipefail
+          ssh -i ~/.ssh/id_deploy -p "${SSH_PORT:-22}" "$SSH_USER@$SSH_HOST" "mkdir -p '$DEST'"
+          rsync -az --delete \
+            --exclude '.git' --exclude 'node_modules' --exclude 'vendor' \
+            --exclude '.env' --exclude 'storage' --exclude 'bootstrap/cache' \
+            -e "ssh -i ~/.ssh/id_deploy -p ${SSH_PORT:-22}" \
+            ./ "$SSH_USER@$SSH_HOST:$DEST/"
+
+      - name: Build & subir (Docker Compose)
+        run: |
+          set -euo pipefail
+          ssh -i ~/.ssh/id_deploy -p "${SSH_PORT:-22}" "$SSH_USER@$SSH_HOST" "
+            set -e
+            cd '$DEST'
+            if [ ! -f .env ]; then
+              echo '::error::Falta o .env em $DEST. Crie o secret DEPLOY_ENV (ou ponha o arquivo na VM).'
+              exit 1
+            fi
+            mkdir -p storage/app/public storage/framework/cache storage/framework/sessions storage/framework/views storage/logs bootstrap/cache
+            sudo docker compose -f deploy/compose.oracle.yml up -d --build
+            sudo docker compose -f deploy/compose.oracle.yml ps
+          "
+
+      - name: Health check (tolerante ao 1º boot)
+        run: |
+          set -uo pipefail
+          echo "Checando http://$SSH_HOST/health (o 1º boot instala tudo e pode demorar)..."
+          for i in $(seq 1 30); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' "http://$SSH_HOST/health" || true)
+            echo "  tentativa $i: HTTP $code"
+            if [ "$code" = "200" ]; then echo "✅ App saudável"; exit 0; fi
+            sleep 10
+          done
+          echo "⚠️ Ainda não respondeu 200. Na 1ª vez o provisionamento (composer + npm) pode levar >5 min."
+          echo "   Logs: ssh $SSH_USER@$SSH_HOST \"cd $DEST && sudo docker compose -f deploy/compose.oracle.yml logs -f app\""
+          exit 0
